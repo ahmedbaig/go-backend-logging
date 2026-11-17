@@ -10,8 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 func TestParseLevel(t *testing.T) {
@@ -152,5 +155,115 @@ func TestDailyRotationCompressAndPrune(t *testing.T) {
 func TestPatternNeedsDate(t *testing.T) {
 	if _, err := NewDailyFile(DailyFileOptions{Dir: t.TempDir(), Pattern: "x.log"}); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+type memInserter struct {
+	mu   sync.Mutex
+	docs map[string][]bson.M
+}
+
+func (m *memInserter) Insert(_ context.Context, coll string, docs []any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.docs == nil {
+		m.docs = map[string][]bson.M{}
+	}
+	for _, d := range docs {
+		m.docs[coll] = append(m.docs[coll], d.(bson.M))
+	}
+	return nil
+}
+
+func (m *memInserter) Close(context.Context) error { return nil }
+
+func (m *memInserter) get(coll string) []bson.M {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]bson.M{}, m.docs[coll]...)
+}
+
+func mongoLogger(t *testing.T) (*Logger, *memInserter) {
+	t.Helper()
+	ins := &memInserter{}
+	l, err := New(Config{MinimumLogLevel: "debug", LogToMongo: true, Mongo: MongoConfig{FlushMs: 10}}, "svc", WithMeta("testing", "1.2.3"), WithInserter(ins))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l, ins
+}
+
+func TestMongoEntriesCarryRequestAndUser(t *testing.T) {
+	l, ins := mongoLogger(t)
+	ctx := WithScope(context.Background())
+	ctx = WithAttrs(ctx, slog.String("requestId", "r1"))
+	inner := WithAttrs(ctx, slog.Int64("userId", 7), slog.String("email", "a@b.c"))
+	l.ErrorContext(inner, "boom", Err(errors.New("bad")), slog.String("stack", "trace"))
+	l.InfoContext(ctx, "GET /x 200 1ms", slog.Int("status", 200), slog.String("route", "GET /x"), slog.String("password", "hunter2"))
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := ins.get(CollectionLogs)
+	if len(logs) != 2 {
+		t.Fatalf("logs = %d", len(logs))
+	}
+	e := logs[0]
+	if e["service"] != "svc" || e["environment"] != "testing" || e["version"] != "1.2.3" || e["level"] != "error" || e["stack"] != "trace" {
+		t.Fatalf("error entry %v", e)
+	}
+	if e["error"].(bson.M)["message"] != "bad" {
+		t.Fatalf("error = %v", e["error"])
+	}
+	access := logs[1]
+	if access["userId"] != int64(7) || access["requestId"] != "r1" {
+		t.Fatalf("access entry misses scope attrs: %v", access)
+	}
+	if access["password"] != Redacted {
+		t.Fatalf("password not redacted: %v", access["password"])
+	}
+
+	dau := ins.get(CollectionDAU)
+	if len(dau) != 1 || dau[0]["action"] != "GET /x" || dau[0]["meta"].(bson.M)["userId"] != int64(7) || dau[0]["logId"] != access["_id"] {
+		t.Fatalf("dau = %v", dau)
+	}
+}
+
+func TestDAUSkipsAnonymousAndCountsEvents(t *testing.T) {
+	l, ins := mongoLogger(t)
+	l.Info("GET /x 200 1ms", slog.Int("status", 200), slog.String("route", "GET /x"))
+	ctx := WithAttrs(context.Background(), slog.Int64("userId", 3))
+	Event(ctx, l.Logger, "weather.viewed", slog.String("city", "Sydney"))
+	l.InfoContext(ctx, "plain line")
+	_ = l.Close()
+	dau := ins.get(CollectionDAU)
+	if len(dau) != 1 || dau[0]["action"] != "weather.viewed" {
+		t.Fatalf("dau = %v", dau)
+	}
+	if len(ins.get(CollectionLogs)) != 3 {
+		t.Fatal("every line goes to logs")
+	}
+}
+
+func TestRedactsNestedGroupsInFiles(t *testing.T) {
+	var buf bytes.Buffer
+	l := slog.New(NewContextHandler(NewJSONHandler(&buf, "svc", LevelInfo), "pin"))
+	l.Info("x", slog.Group("body", slog.String("refresh_token", "abc"), slog.String("pin", "1234"), slog.String("name", "ok")))
+	var m map[string]any
+	_ = json.Unmarshal(buf.Bytes(), &m)
+	body := m["body"].(map[string]any)
+	if body["refresh_token"] != Redacted || body["pin"] != Redacted || body["name"] != "ok" {
+		t.Fatalf("body = %v", body)
+	}
+}
+
+func TestMongoGroupsNest(t *testing.T) {
+	l, ins := mongoLogger(t)
+	l.WithGroup("req").With(slog.String("method", "GET")).Info("x", slog.Int("n", 1))
+	_ = l.Close()
+	e := ins.get(CollectionLogs)[0]
+	req := e["req"].(bson.M)
+	if req["method"] != "GET" || req["n"] != int64(1) {
+		t.Fatalf("req = %v", req)
 	}
 }

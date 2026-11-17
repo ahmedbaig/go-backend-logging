@@ -11,10 +11,6 @@ import (
 	"time"
 )
 
-type fanout struct {
-	handlers []slog.Handler
-}
-
 func Fanout(hs ...slog.Handler) slog.Handler {
 	return &fanout{handlers: hs}
 }
@@ -76,16 +72,6 @@ func NewJSONHandler(w io.Writer, app string, min slog.Leveler) slog.Handler {
 		Level:       min,
 		ReplaceAttr: replaceAttr,
 	}).WithAttrs([]slog.Attr{slog.String("app", app)})
-}
-
-type consoleHandler struct {
-	mu    *sync.Mutex
-	w     io.Writer
-	app   string
-	min   slog.Leveler
-	color bool
-	attrs []slog.Attr
-	group string
 }
 
 func NewConsoleHandler(w io.Writer, app string, min slog.Leveler, color bool) slog.Handler {

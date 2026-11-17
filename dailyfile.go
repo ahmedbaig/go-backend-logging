@@ -8,28 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
-type DailyFileOptions struct {
-	Dir      string
-	Pattern  string
-	Symlink  string
-	Compress bool
-	MaxFiles int
-	Now      func() time.Time
-}
-
-type DailyFile struct {
-	opts DailyFileOptions
-	mu   sync.Mutex
-	day  string
-	f    *os.File
-	wg   sync.WaitGroup
-}
-
-const dateLayout = "2006-01-02"
 
 func NewDailyFile(o DailyFileOptions) (*DailyFile, error) {
 	if o.Now == nil {

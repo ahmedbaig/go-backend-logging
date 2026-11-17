@@ -8,25 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-)
 
-const (
-	LevelVerbose = slog.Level(-8)
-	LevelDebug   = slog.LevelDebug
-	LevelInfo    = slog.LevelInfo
-	LevelWarn    = slog.LevelWarn
-	LevelError   = slog.LevelError
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
-
-type Config struct {
-	LogDirectory    string `json:"logDirectory"`
-	ZippedArchive   bool   `json:"zippedArchive"`
-	MinimumLogLevel string `json:"minimumLogLevel" validate:"omitempty,oneof=error warn info debug verbose"`
-	LogToFile       bool   `json:"logToFile"`
-	LogToConsole    bool   `json:"logToConsole"`
-	MaxFiles        int    `json:"maxFiles" validate:"min=0"`
-	ConsoleColor    *bool  `json:"consoleColor,omitempty"`
-}
 
 func DefaultConfig() Config {
 	return Config{
@@ -68,15 +52,22 @@ func LevelName(l slog.Level) string {
 	return "error"
 }
 
-type Logger struct {
-	*slog.Logger
-	closers []io.Closer
+func WithMeta(environment, version string) Option {
+	return func(o *settings) { o.environment, o.version = environment, version }
 }
 
-func New(cfg Config, app string) (*Logger, error) {
+func WithInserter(i Inserter) Option {
+	return func(o *settings) { o.inserter = i }
+}
+
+func New(cfg Config, app string, opts ...Option) (*Logger, error) {
 	min, err := ParseLevel(cfg.MinimumLogLevel)
 	if err != nil {
 		return nil, err
+	}
+	var o settings
+	for _, opt := range opts {
+		opt(&o)
 	}
 	host, _ := os.Hostname()
 
@@ -112,11 +103,27 @@ func New(cfg Config, app string) (*Logger, error) {
 		}
 	}
 
+	if cfg.LogToMongo {
+		ins := o.inserter
+		if ins == nil {
+			store, err := openMongo(cfg.Mongo)
+			if err != nil {
+				closeAll(closers)
+				return nil, err
+			}
+			ins = store
+		}
+		s := newSink(ins, cfg.Mongo)
+		closers = append(closers, s)
+		base := bson.M{"service": app, "host": host, "environment": o.environment, "version": o.version}
+		handlers = append(handlers, newMongoHandler(s, min, base))
+	}
+
 	var h slog.Handler = discard{}
 	if len(handlers) > 0 {
 		h = Fanout(handlers...)
 	}
-	return &Logger{Logger: slog.New(NewContextHandler(h)), closers: closers}, nil
+	return &Logger{Logger: slog.New(NewContextHandler(h, cfg.RedactKeys...)), closers: closers}, nil
 }
 
 func (l *Logger) Verbose(msg string, args ...any) {
@@ -145,8 +152,6 @@ func Err(err error) slog.Attr {
 	}
 	return slog.Any("error", err)
 }
-
-type discard struct{}
 
 func (discard) Enabled(context.Context, slog.Level) bool  { return false }
 func (discard) Handle(context.Context, slog.Record) error { return nil }
