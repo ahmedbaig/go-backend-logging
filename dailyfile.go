@@ -11,7 +11,6 @@ import (
 	"time"
 )
 
-
 func NewDailyFile(o DailyFileOptions) (*DailyFile, error) {
 	if o.Now == nil {
 		o.Now = time.Now
