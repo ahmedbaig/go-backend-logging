@@ -2,7 +2,7 @@ module github.com/ahmedbaig/go-backend-logging
 
 go 1.27.3
 
-require go.mongodb.org/mongo-driver/v2 v2.10.0
+require go.mongodb.org/mongo-driver/v2 v2.10.1
 
 require (
 	github.com/klauspost/compress v1.20.3 // indirect
